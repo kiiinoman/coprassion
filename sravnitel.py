@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-compare_docx.py — Сравнивает два Word-документа с сохранением форматирования.
+compare_docx.py — Сравнивает два Word-документа, сохраняя оригинальное форматирование.
 
 Результат:
-  • <file1>_diff.docx — оригинал файла 1, удалённые (относительно файла 2)
-                        фрагменты выделены КРАСНЫМ цветом
-  • <file2>_diff.docx — оригинал файла 2, добавленные (которых не было в файле 1)
-                        фрагменты выделены ЗЕЛЁНЫМ цветом
+  • file1_marked.docx — копия файла 1, где красным выделено всё, что было удалено/изменено
+  • file2_marked.docx — копия файла 2, где зелёным выделено всё, что было добавлено/изменено
 
 Использование:
     python compare_docx.py file1.docx file2.docx
@@ -18,9 +16,9 @@ compare_docx.py — Сравнивает два Word-документа с со�
 import sys
 import os
 import re
-import difflib
 import zipfile
 import shutil
+import difflib
 from copy import deepcopy
 from lxml import etree
 
@@ -28,293 +26,244 @@ from lxml import etree
 W   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML = "http://www.w3.org/XML/1998/namespace"
 WNS = f"{{{W}}}"
-XSPACE = f"{{{XML}}}space"
-
-RED   = "FF0000"
-GREEN = "00AA00"
-
 
 def wtag(name: str) -> str:
     return f"{WNS}{name}"
 
+# ─────────────────────────────── Утилиты ──────────────────────────────────────
 
-# ─────────────────────────── Работа с ZIP/XML ─────────────────────────────────
-
-def read_xml(docx_path: str) -> bytes:
-    with zipfile.ZipFile(docx_path) as z:
+def read_docx_xml(path: str) -> bytes:
+    with zipfile.ZipFile(path) as z:
         return z.read("word/document.xml")
 
-
-def write_xml(docx_src: str, docx_dst: str, new_xml: bytes):
-    """Копирует docx_src в docx_dst, заменяя document.xml."""
-    shutil.copy2(docx_src, docx_dst)
-    tmp = docx_dst + ".tmp"
-    with zipfile.ZipFile(docx_dst, "r") as zin, \
+def write_docx_xml(src_docx: str, dst_docx: str, new_xml: bytes):
+    """Копирует src_docx в dst_docx, заменяя word/document.xml."""
+    shutil.copy2(src_docx, dst_docx)
+    tmp = dst_docx + ".tmp"
+    with zipfile.ZipFile(dst_docx, "r") as zin, \
          zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            if item.filename == "word/document.xml":
-                zout.writestr(item, new_xml)
+        for info in zin.infolist():
+            if info.filename == "word/document.xml":
+                zout.writestr(info, new_xml)
             else:
-                zout.writestr(item, zin.read(item.filename))
-    os.replace(tmp, docx_dst)
+                zout.writestr(info, zin.read(info.filename))
+    os.replace(tmp, dst_docx)
 
+def para_text(p_elem) -> str:
+    return "".join(t.text or "" for t in p_elem.iter(wtag("t")))
 
-def serialize(root) -> bytes:
-    return etree.tostring(root, xml_declaration=True,
-                          encoding="UTF-8", standalone=True)
+def get_body_paragraphs(root) -> list:
+    body = root.find(f".//{wtag('body')}")
+    return [c for c in body if c.tag == wtag("p")]
 
+# ─────────────────── Работа с форматированием ────────────────────────────────
 
-# ─────────────────────────── Утилиты ──────────────────────────────────────────
-
-def para_text(para) -> str:
-    return "".join(t.text or "" for t in para.iter(wtag("t")))
-
-
-def clone_rPr(run) -> etree.Element:
-    """Возвращает копию <w:rPr> рана, или новый пустой <w:rPr>."""
-    rpr = run.find(wtag("rPr"))
-    return deepcopy(rpr) if rpr is not None else etree.Element(wtag("rPr"))
-
-
-def apply_color(rPr: etree.Element, hex_color: str):
-    """Устанавливает или заменяет <w:color> в rPr."""
-    existing = rPr.find(wtag("color"))
+def set_color_on_rPr(rPr_elem, hex_color: str):
+    existing = rPr_elem.find(wtag("color"))
     if existing is not None:
-        rPr.remove(existing)
+        rPr_elem.remove(existing)
     color_el = etree.Element(wtag("color"))
     color_el.set(wtag("val"), hex_color)
-    rPr.insert(0, color_el)
+    rPr_elem.insert(0, color_el)
 
-
-def make_run(text: str, orig_run: etree.Element,
-             color: str | None = None) -> etree.Element:
-    """
-    Создаёт <w:r> с текстом text и форматированием из orig_run.
-    Если color задан — добавляет цвет.
-    """
+def make_colored_run(text: str, hex_color: str, source_rPr=None) -> etree.Element:
     r = etree.Element(wtag("r"))
-    rPr = clone_rPr(orig_run)
-    if color:
-        apply_color(rPr, color)
+    rPr = deepcopy(source_rPr) if source_rPr is not None else etree.Element(wtag("rPr"))
+    set_color_on_rPr(rPr, hex_color)
     r.append(rPr)
-
     t = etree.SubElement(r, wtag("t"))
     t.text = text
-    if text != text.strip() or text.startswith(" ") or text.endswith(" "):
-        t.set(XSPACE, "preserve")
+    if text and (text[0] == " " or text[-1] == " "):
+        t.set(f"{{{XML}}}space", "preserve")
     return r
 
+def make_plain_run(text: str, source_rPr=None) -> etree.Element:
+    r = etree.Element(wtag("r"))
+    if source_rPr is not None:
+        r.append(deepcopy(source_rPr))
+    t = etree.SubElement(r, wtag("t"))
+    t.text = text
+    if text and (text[0] == " " or text[-1] == " "):
+        t.set(f"{{{XML}}}space", "preserve")
+    return r
 
-# ─────────────────────────── Атомы абзаца ─────────────────────────────────────
-# Атом = (text_token, source_run)
-
-def para_atoms(para) -> list[tuple[str, etree.Element]]:
-    """
-    Разбивает все <w:r> абзаца на токены (слово или пробел),
-    сохраняя ссылку на исходный run для копирования форматирования.
-    """
-    atoms = []
-    for r in para.iter(wtag("r")):
+def paragraph_char_tape(p_elem) -> list:
+    """Список (char, rPr) для всех символов абзаца."""
+    tape = []
+    for r in p_elem.iter(wtag("r")):
+        rPr = r.find(wtag("rPr"))
+        rPr_copy = deepcopy(rPr) if rPr is not None else None
         for t in r.findall(wtag("t")):
-            text = t.text or ""
-            tokens = re.split(r"(\s+)", text)
-            for tok in tokens:
-                if tok:
-                    atoms.append((tok, r))
-    return atoms
+            for ch in (t.text or ""):
+                tape.append((ch, rPr_copy))
+    return tape
 
+def make_fully_colored_paragraph(p_elem, color: str) -> etree.Element:
+    new_p = etree.Element(wtag("p"))
+    pPr = p_elem.find(wtag("pPr"))
+    if pPr is not None:
+        new_p.append(deepcopy(pPr))
+    for r in p_elem.iter(wtag("r")):
+        new_r = deepcopy(r)
+        rPr = new_r.find(wtag("rPr"))
+        if rPr is None:
+            rPr = etree.Element(wtag("rPr"))
+            new_r.insert(0, rPr)
+        set_color_on_rPr(rPr, color)
+        new_p.append(new_r)
+    return new_p
 
-# ─────────────────────────── Перестройка абзаца ───────────────────────────────
+def copy_paragraph_unchanged(p_elem) -> etree.Element:
+    return deepcopy(p_elem)
 
-def rebuild_para(orig_para: etree.Element,
-                 diff_atoms: list[tuple[str, etree.Element, bool]],
-                 color: str) -> etree.Element:
+# ─────────────── Перестройка абзаца с точечной подсветкой ────────────────────
+
+def rebuild_paragraph_with_highlights(p_elem, old_text: str, new_text: str,
+                                       color: str, use_old: bool) -> etree.Element:
     """
-    Возвращает новый <w:p> на основе orig_para:
-      - сохраняет <w:pPr> и все не-<w:r> элементы
-      - заменяет <w:r> новыми согласно diff_atoms
-        (highlighted=True → окрашиваем в color)
+    Строит новый <w:p>, сохраняя форматирование оригинальных run-ов.
+    Изменённые слова перекрашивает в color.
+    use_old=True  → базовый текст old_text (для файла 1, красим удалённое)
+    use_old=False → базовый текст new_text (для файла 2, красим добавленное)
     """
-    new_p = deepcopy(orig_para)
+    new_p = etree.Element(wtag("p"))
+    pPr = p_elem.find(wtag("pPr"))
+    if pPr is not None:
+        new_p.append(deepcopy(pPr))
 
-    # Убираем все <w:r> (и bookmarks/hyperlinks чтобы не дублировать)
-    for child in list(new_p):
-        if child.tag in (wtag("r"), wtag("hyperlink"),
-                         wtag("bookmarkStart"), wtag("bookmarkEnd"),
-                         wtag("proofErr")):
-            new_p.remove(child)
+    tape = paragraph_char_tape(p_elem)
 
-    for text, orig_run, highlighted in diff_atoms:
-        c = color if highlighted else None
-        new_p.append(make_run(text, orig_run, c))
+    base_words  = re.split(r"(\s+)", old_text)
+    other_words = re.split(r"(\s+)", new_text)
+
+    sm = difflib.SequenceMatcher(None, base_words, other_words, autojunk=False)
+
+    # Строим список (segment_text, is_changed) для нужной стороны
+    segments = []  # list of (str, bool)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if use_old:
+            seg = "".join(base_words[i1:i2])
+            segments.append((seg, op != "equal"))
+        else:
+            seg = "".join(other_words[j1:j2])
+            segments.append((seg, op != "equal"))
+
+    # Сопоставляем символы сегментов с лентой форматирования
+    tape_idx = 0
+    for seg_text, is_changed in segments:
+        if not seg_text:
+            continue
+        # rPr первого символа сегмента
+        seg_rPr = tape[tape_idx][1] if tape_idx < len(tape) else None
+        tape_idx += len(seg_text)
+
+        if is_changed:
+            new_p.append(make_colored_run(seg_text, color, seg_rPr))
+        else:
+            new_p.append(make_plain_run(seg_text, seg_rPr))
 
     return new_p
 
+# ──────────────────────────── Основная функция ────────────────────────────────
 
-# ─────────────────────────── Основная логика ──────────────────────────────────
+def _replace_body_paragraphs(root, new_paras: list):
+    body = root.find(f".//{wtag('body')}")
+    sect_pr = body.find(wtag("sectPr"))
+    for p in [c for c in list(body) if c.tag == wtag("p")]:
+        body.remove(p)
+    if sect_pr is not None:
+        idx = list(body).index(sect_pr)
+        for i, p in enumerate(new_paras):
+            body.insert(idx + i, p)
+    else:
+        for p in new_paras:
+            body.append(p)
 
-def process(docx1: str, docx2: str, out1: str, out2: str):
-    xml1 = read_xml(docx1)
-    xml2 = read_xml(docx2)
+def _output_name(path: str, suffix: str) -> str:
+    base, ext = os.path.splitext(path)
+    return f"{base}_{suffix}{ext}"
 
-    root1 = etree.fromstring(xml1)
-    root2 = etree.fromstring(xml2)
+def process(docx1: str, docx2: str):
+    out1 = _output_name(docx1, "marked")
+    out2 = _output_name(docx2, "marked")
 
-    body1 = root1.find(f".//{wtag('body')}")
-    body2 = root2.find(f".//{wtag('body')}")
+    root1 = etree.fromstring(read_docx_xml(docx1))
+    root2 = etree.fromstring(read_docx_xml(docx2))
 
-    paras1 = [p for p in body1 if p.tag == wtag("p")]
-    paras2 = [p for p in body2 if p.tag == wtag("p")]
-
+    paras1 = get_body_paragraphs(root1)
+    paras2 = get_body_paragraphs(root2)
     texts1 = [para_text(p) for p in paras1]
     texts2 = [para_text(p) for p in paras2]
 
-    # ── Diff абзацев ──────────────────────────────────────────────────────
-    seq = difflib.SequenceMatcher(None, texts1, texts2, autojunk=False)
+    sm = difflib.SequenceMatcher(None, texts1, texts2, autojunk=False)
 
-    # Индексы абзацев, которые нужно перекрасить
-    # para_idx → list of (text, run, highlighted)
-    paint1: dict[int, list] = {}   # file1: красим красным
-    paint2: dict[int, list] = {}   # file2: красим зелёным
+    new_paras1: list = []
+    new_paras2: list = []
 
-    for tag, i1, i2, j1, j2 in seq.get_opcodes():
+    RED   = "FF0000"
+    GREEN = "00B050"
 
-        if tag == "equal":
-            pass  # Ничего не делаем
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for idx in range(i2 - i1):
+                new_paras1.append(copy_paragraph_unchanged(paras1[i1 + idx]))
+                new_paras2.append(copy_paragraph_unchanged(paras2[j1 + idx]))
 
-        elif tag == "delete":
-            # Абзацы только в file1 → все токены красные
-            for idx in range(i1, i2):
-                atoms = para_atoms(paras1[idx])
-                paint1[idx] = [(t, r, True) for t, r in atoms]
+        elif op == "replace":
+            old_block = paras1[i1:i2]
+            new_block = paras2[j1:j2]
+            count = max(len(old_block), len(new_block))
+            for idx in range(count):
+                has_old = idx < len(old_block)
+                has_new = idx < len(new_block)
+                if has_old and has_new:
+                    p1, p2 = old_block[idx], new_block[idx]
+                    t1, t2 = para_text(p1), para_text(p2)
+                    new_paras1.append(rebuild_paragraph_with_highlights(p1, t1, t2, RED,   use_old=True))
+                    new_paras2.append(rebuild_paragraph_with_highlights(p2, t1, t2, GREEN, use_old=False))
+                elif has_old:
+                    new_paras1.append(make_fully_colored_paragraph(old_block[idx], RED))
+                else:
+                    new_paras2.append(make_fully_colored_paragraph(new_block[idx], GREEN))
 
-        elif tag == "insert":
-            # Абзацы только в file2 → все токены зелёные
-            for idx in range(j1, j2):
-                atoms = para_atoms(paras2[idx])
-                paint2[idx] = [(t, r, True) for t, r in atoms]
+        elif op == "delete":
+            for p in paras1[i1:i2]:
+                new_paras1.append(make_fully_colored_paragraph(p, RED))
 
-        elif tag == "replace":
-            # Для каждой пары абзацев делаем пословный diff
-            block1 = paras1[i1:i2]
-            block2 = paras2[j1:j2]
+        elif op == "insert":
+            for p in paras2[j1:j2]:
+                new_paras2.append(make_fully_colored_paragraph(p, GREEN))
 
-            # Собираем токены всего блока, разделяя абзацы маркером None
-            def collect(paras_list):
-                result = []
-                for p in paras_list:
-                    result.extend(para_atoms(p))
-                    result.append(("\n", None))
-                return result
+    _replace_body_paragraphs(root1, new_paras1)
+    _replace_body_paragraphs(root2, new_paras2)
 
-            atoms1_block = collect(block1)
-            atoms2_block = collect(block2)
+    write_docx_xml(docx1, out1,
+                   etree.tostring(root1, xml_declaration=True, encoding="UTF-8", standalone=True))
+    write_docx_xml(docx2, out2,
+                   etree.tostring(root2, xml_declaration=True, encoding="UTF-8", standalone=True))
 
-            toks1 = [a[0] for a in atoms1_block]
-            toks2 = [a[0] for a in atoms2_block]
+    print(f"✅ {out1}  ← красным: что удалили/изменили")
+    print(f"✅ {out2}  ← зелёным: что добавили/изменили")
 
-            wseq = difflib.SequenceMatcher(None, toks1, toks2, autojunk=False)
-
-            # Результирующие токены: (text, run, highlighted)
-            res1: list[tuple[str, object, bool]] = []
-            res2: list[tuple[str, object, bool]] = []
-
-            for op, wi1, wi2, wj1, wj2 in wseq.get_opcodes():
-                if op == "equal":
-                    for k in range(wi1, wi2):
-                        res1.append((toks1[k], atoms1_block[k][1], False))
-                    for k in range(wj1, wj2):
-                        res2.append((toks2[k], atoms2_block[k][1], False))
-                elif op == "delete":
-                    for k in range(wi1, wi2):
-                        res1.append((toks1[k], atoms1_block[k][1], True))
-                elif op == "insert":
-                    for k in range(wj1, wj2):
-                        res2.append((toks2[k], atoms2_block[k][1], True))
-                elif op == "replace":
-                    for k in range(wi1, wi2):
-                        res1.append((toks1[k], atoms1_block[k][1], True))
-                    for k in range(wj1, wj2):
-                        res2.append((toks2[k], atoms2_block[k][1], True))
-
-            # Разбиваем обратно по абзацам (по маркеру "\n")
-            def split_chunks(res, orig_paras):
-                chunks, cur = [], []
-                for item in res:
-                    if item[0] == "\n":
-                        chunks.append(cur)
-                        cur = []
-                    else:
-                        cur.append(item)
-                if cur:
-                    chunks.append(cur)
-                while len(chunks) < len(orig_paras):
-                    chunks.append([])
-                return chunks[:len(orig_paras)]
-
-            chunks1 = split_chunks(res1, block1)
-            chunks2 = split_chunks(res2, block2)
-
-            for local_idx, chunk in enumerate(chunks1):
-                if chunk:
-                    paint1[i1 + local_idx] = chunk
-            for local_idx, chunk in enumerate(chunks2):
-                if chunk:
-                    paint2[j1 + local_idx] = chunk
-
-    # ── Применяем изменения к абзацам ─────────────────────────────────────
-
-    def apply_paint(body, paras, paint_map, color):
-        """Заменяет нужные абзацы в body перекрашенными версиями."""
-        for idx, new_para_data in paint_map.items():
-            orig = paras[idx]
-            new_p = rebuild_para(orig, new_para_data, color)
-            # Заменяем в body
-            parent = orig.getparent()
-            pos = list(parent).index(orig)
-            parent.remove(orig)
-            parent.insert(pos, new_p)
-
-    apply_paint(body1, paras1, paint1, RED)
-    apply_paint(body2, paras2, paint2, GREEN)
-
-    write_xml(docx1, out1, serialize(root1))
-    write_xml(docx2, out2, serialize(root2))
-
-
-# ─────────────────────────── Точка входа ──────────────────────────────────────
+# ────────────────────────────── Точка входа ───────────────────────────────────
 
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-
     f1, f2 = sys.argv[1], sys.argv[2]
-
     for f in (f1, f2):
         if not os.path.exists(f):
             print(f"❌ Файл не найден: {f}")
             sys.exit(1)
-
-    base1 = os.path.splitext(os.path.basename(f1))[0]
-    base2 = os.path.splitext(os.path.basename(f2))[0]
-    out1  = f"{base1}_diff.docx"
-    out2  = f"{base2}_diff.docx"
-
     print(f"📄 Файл 1: {f1}")
     print(f"📄 Файл 2: {f2}")
     print("🔍 Сравниваю...\n")
-
-    process(f1, f2, out1, out2)
-
-    print(f"✅ {out1}  — удалённое (было в файле 1) выделено КРАСНЫМ")
-    print(f"✅ {out2}  — добавленное (только в файле 2) выделено ЗЕЛЁНЫМ")
+    process(f1, f2)
     print()
     print("Легенда:")
-    print("  🔴 Красный  — текст был в файле 1, отсутствует в файле 2")
-    print("  🟢 Зелёный  — текст появился в файле 2, отсутствовал в файле 1")
-    print("  ⚪ Обычный  — текст одинаков в обоих файлах")
-
+    print("  🔴 Красный  (файл 1) — текст, которого больше нет в файле 2")
+    print("  🟢 Зелёный  (файл 2) — текст, которого не было в файле 1")
 
 if __name__ == "__main__":
     main()
