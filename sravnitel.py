@@ -19,7 +19,6 @@ import re
 import zipfile
 import shutil
 import difflib
-from copy import deepcopy
 from lxml import etree
 
 W   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -32,7 +31,6 @@ def wtag(name):
 # ──────────────────────────── ZIP helpers ─────────────────────────────────────
 
 def read_zip(path):
-    """Читает все файлы из ZIP, возвращает dict {filename: bytes}."""
     data = {}
     with zipfile.ZipFile(path) as z:
         for info in z.infolist():
@@ -40,10 +38,6 @@ def read_zip(path):
     return data
 
 def write_zip(src_docx, dst_docx, replacements):
-    """
-    Копирует src_docx в dst_docx, заменяя файлы из словаря replacements
-    {filename: new_bytes}.
-    """
     shutil.copy2(src_docx, dst_docx)
     tmp = dst_docx + ".tmp"
     with zipfile.ZipFile(dst_docx, "r") as zin, \
@@ -60,11 +54,17 @@ def write_zip(src_docx, dst_docx, replacements):
 def para_text(p_elem):
     return "".join(t.text or "" for t in p_elem.iter(wtag("t")))
 
+def normalize(text):
+    """
+    Нормализует текст для сравнения:
+    - убирает leading/trailing пробелы
+    - схлопывает внутренние пробелы/переносы в один пробел
+    - приводит к нижнему регистру
+    Используется ТОЛЬКО для сравнения, не для отображения.
+    """
+    return re.sub(r"\s+", " ", text).strip().lower()
+
 def collect_paragraphs(root):
-    """
-    Возвращает ВСЕ <w:p> в документе включая те, что внутри таблиц.
-    Порядок — document order.
-    """
     return list(root.iter(wtag("p")))
 
 def set_color_on_rPr(rPr_elem, hex_color):
@@ -76,7 +76,6 @@ def set_color_on_rPr(rPr_elem, hex_color):
     rPr_elem.insert(0, el)
 
 def colorize_run(r_elem, hex_color):
-    """Красит один run не трогая ничего кроме <w:color>."""
     rPr = r_elem.find(wtag("rPr"))
     if rPr is None:
         rPr = etree.Element(wtag("rPr"))
@@ -84,21 +83,24 @@ def colorize_run(r_elem, hex_color):
     set_color_on_rPr(rPr, hex_color)
 
 def colorize_paragraph_full(p_elem, hex_color):
-    """Красит все run-ы абзаца целиком."""
     for r in p_elem.findall(f".//{wtag('r')}"):
         colorize_run(r, hex_color)
 
 def colorize_paragraph_partial(p_elem, old_text, new_text, hex_color, use_old):
     """
-    Красит только run-ы, попадающие в изменённые диапазоны (word-level diff).
-    Структура XML не меняется — только добавляется/заменяется <w:color>.
+    Красит только run-ы попадающие в изменённые диапазоны (word-level diff).
+    Сравнение нормализованное, позиции считаются по оригинальному тексту.
     """
     base_words  = re.split(r"(\s+)", old_text)
     other_words = re.split(r"(\s+)", new_text)
 
-    sm = difflib.SequenceMatcher(None, base_words, other_words, autojunk=False)
+    # Нормализованные версии слов для сравнения
+    norm_base  = [w.lower() for w in base_words]
+    norm_other = [w.lower() for w in other_words]
 
-    # Строим список изменённых символьных диапазонов в базовом тексте
+    sm = difflib.SequenceMatcher(None, norm_base, norm_other, autojunk=False)
+
+    # Строим изменённые диапазоны в символах оригинального текста
     changed_ranges = []
     pos = 0
     for op, i1, i2, j1, j2 in sm.get_opcodes():
@@ -114,7 +116,6 @@ def colorize_paragraph_partial(p_elem, old_text, new_text, hex_color, use_old):
     if not changed_ranges:
         return
 
-    # Проходим по run-ам, отслеживая позицию в тексте
     char_pos = 0
     for r in p_elem.findall(f".//{wtag('r')}"):
         run_text = "".join(t.text or "" for t in r.findall(wtag("t")))
@@ -123,7 +124,6 @@ def colorize_paragraph_partial(p_elem, old_text, new_text, hex_color, use_old):
             continue
         run_start = char_pos
         run_end   = char_pos + run_len
-        # Красим если run хоть частично пересекается с изменённым диапазоном
         if any(s < run_end and e > run_start for s, e in changed_ranges):
             colorize_run(r, hex_color)
         char_pos += run_len
@@ -141,35 +141,43 @@ def process(docx1, docx2):
     zip1 = read_zip(docx1)
     zip2 = read_zip(docx2)
 
-    # Парсим document.xml каждого файла
     root1 = etree.fromstring(zip1["word/document.xml"])
     root2 = etree.fromstring(zip2["word/document.xml"])
 
-    # Собираем все абзацы (включая внутри таблиц) — НЕ вырезаем их из дерева
     paras1 = collect_paragraphs(root1)
     paras2 = collect_paragraphs(root2)
-    texts1 = [para_text(p) for p in paras1]
-    texts2 = [para_text(p) for p in paras2]
+
+    # Для сравнения используем нормализованный текст
+    texts1_raw  = [para_text(p) for p in paras1]
+    texts2_raw  = [para_text(p) for p in paras2]
+    texts1_norm = [normalize(t) for t in texts1_raw]
+    texts2_norm = [normalize(t) for t in texts2_raw]
 
     RED   = "FF0000"
     GREEN = "00B050"
 
-    sm = difflib.SequenceMatcher(None, texts1, texts2, autojunk=False)
+    sm = difflib.SequenceMatcher(None, texts1_norm, texts2_norm, autojunk=False)
 
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op == "equal":
-            continue  # ничего не делаем — оригинальные run-ы остаются как есть
+            # Тексты совпадают после нормализации — ничего не красим
+            continue
 
         elif op == "replace":
             old_block = paras1[i1:i2]
             new_block = paras2[j1:j2]
+            old_raw   = texts1_raw[i1:i2]
+            new_raw   = texts2_raw[j1:j2]
             count = max(len(old_block), len(new_block))
             for idx in range(count):
                 has_old = idx < len(old_block)
                 has_new = idx < len(new_block)
                 if has_old and has_new:
-                    t1 = texts1[i1 + idx]
-                    t2 = texts2[j1 + idx]
+                    t1 = old_raw[idx]
+                    t2 = new_raw[idx]
+                    # Если после нормализации одинаковы — не красим
+                    if normalize(t1) == normalize(t2):
+                        continue
                     colorize_paragraph_partial(old_block[idx], t1, t2, RED,   use_old=True)
                     colorize_paragraph_partial(new_block[idx], t1, t2, GREEN, use_old=False)
                 elif has_old:
@@ -185,15 +193,14 @@ def process(docx1, docx2):
             for p in paras2[j1:j2]:
                 colorize_paragraph_full(p, GREEN)
 
-    # Сериализуем изменённые деревья обратно в байты
     new_xml1 = etree.tostring(root1, xml_declaration=True, encoding="UTF-8", standalone=True)
     new_xml2 = etree.tostring(root2, xml_declaration=True, encoding="UTF-8", standalone=True)
 
     write_zip(docx1, out1, {"word/document.xml": new_xml1})
     write_zip(docx2, out2, {"word/document.xml": new_xml2})
 
-    print(f"OK {out1}  <- красным: что удалили/изменили")
-    print(f"OK {out2}  <- зелёным: что добавили/изменили")
+    print("OK {}  <- красным: что удалили/изменили".format(out1))
+    print("OK {}  <- зелёным: что добавили/изменили".format(out2))
 
 # ──────────────────────────── Точка входа ─────────────────────────────────────
 
@@ -204,10 +211,10 @@ def main():
     f1, f2 = sys.argv[1], sys.argv[2]
     for f in (f1, f2):
         if not os.path.exists(f):
-            print(f"Файл не найден: {f}")
+            print("Файл не найден: {}".format(f))
             sys.exit(1)
-    print(f"Файл 1: {f1}")
-    print(f"Файл 2: {f2}")
+    print("Файл 1: {}".format(f1))
+    print("Файл 2: {}".format(f2))
     print("Сравниваю...\n")
     process(f1, f2)
     print()
